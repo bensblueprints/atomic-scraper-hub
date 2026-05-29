@@ -36,6 +36,8 @@ db.exec(`
     plan_price    REAL DEFAULT 0,
     status        TEXT DEFAULT 'active',
     email_sent    INTEGER DEFAULT 0,
+    active_device_id TEXT,
+    token         TEXT,
     created_at    INTEGER DEFAULT (unixepoch()),
     updated_at    INTEGER DEFAULT (unixepoch())
   );
@@ -49,7 +51,46 @@ db.exec(`
   );
 `);
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// Migrate existing tables if columns are missing
+try { db.exec("ALTER TABLE purchases ADD COLUMN active_device_id TEXT"); } catch(e) {}
+try { db.exec("ALTER TABLE purchases ADD COLUMN token TEXT"); } catch(e) {}
+
+// ── Key helpers ───────────────────────────────────────────────────────────────
+function normalizeLicenseKey(key) {
+  const cleaned = key.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (cleaned.startsWith('WT') && cleaned.length === 18) {
+    const b = cleaned.slice(2);
+    return `WT-${b.slice(0,4)}-${b.slice(4,8)}-${b.slice(8,12)}-${b.slice(12,16)}`;
+  }
+  if (cleaned.startsWith('W') && cleaned.endsWith('W') && cleaned.length === 22) {
+    return `W-${cleaned.slice(1,7)}-${cleaned.slice(7,15)}-${cleaned.slice(15,22)}`;
+  }
+  return key.trim().toUpperCase();
+}
+
+function isWhopKey(key) {
+  return /^W-[A-Z0-9]{6}-[A-Z0-9]{8}-[A-Z0-9]{7}W$/.test(key);
+}
+
+async function callWhopValidate(key, deviceId) {
+  if (!WHOP_API_KEY) return { status: 0, body: {} };
+  try {
+    const resp = await fetch(
+      `https://api.whop.com/api/v2/memberships/${encodeURIComponent(key)}/validate_license`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${WHOP_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ metadata: { machine_id: deviceId } }),
+      }
+    );
+    const body = await resp.json().catch(() => ({}));
+    return { status: resp.status, body };
+  } catch(e) {
+    return { status: 0, body: { error: String(e) } };
+  }
+}
+
+// ── Signature verification ────────────────────────────────────────────────────
 function verifyWhopSignature(rawBody, header) {
   if (!WHOP_WEBHOOK_SECRET || !header) return false;
   const parts = Object.fromEntries(header.split(',').map(p => p.split('=')));
@@ -129,12 +170,117 @@ async function sendDownloadEmail(email, licenseKey) {
 // ── App ───────────────────────────────────────────────────────────────────────
 const app = express();
 
-// Raw body needed for signature verification
+// Raw body needed for webhook signature verification
 app.use('/api/whop/webhook', express.raw({ type: '*/*' }));
 app.use(express.json());
 
 // Health
 app.get('/healthz', (req, res) => res.json({ ok: true }));
+
+// ── License activate ──────────────────────────────────────────────────────────
+app.post('/api/license/activate', async (req, res) => {
+  const { key, deviceId, product } = req.body || {};
+  if (!key || !deviceId) return res.status(400).json({ ok: false, error: 'missing_params' });
+
+  const normalized = normalizeLicenseKey(key);
+  let row = db.prepare('SELECT * FROM purchases WHERE license_key = ?').get(normalized);
+
+  if (row) {
+    if (row.status !== 'active') return res.json({ ok: false, error: 'license_refunded' });
+    if (row.active_device_id && row.active_device_id !== deviceId) {
+      return res.json({ ok: false, error: 'already_active',
+        message: 'This key is already activated on another device. Visit whop.com/@me to reset.' });
+    }
+    const token = row.token || crypto.randomBytes(32).toString('hex');
+    db.prepare('UPDATE purchases SET active_device_id = ?, token = ?, updated_at = unixepoch() WHERE license_key = ?')
+      .run(deviceId, token, normalized);
+    const tier = (row.plan_price && row.plan_price > 0) ? 'paid' : 'free';
+    console.log(`[activate] ok key=${normalized} device=${deviceId} tier=${tier}`);
+    return res.json({ ok: true, token, tier, email: row.email });
+  }
+
+  // Not in DB — try live Whop validation (handles key resets + missed webhooks)
+  if (isWhopKey(normalized) && WHOP_API_KEY) {
+    const { status, body } = await callWhopValidate(normalized, deviceId);
+    console.log(`[activate] whop live check status=${status} key=${normalized}`);
+
+    if (status === 200 || status === 201) {
+      const membershipId = body.id || '';
+      const email        = body.email || '';
+      const planId       = body.plan?.id || '';
+      const planPrice    = body.plan?.price ?? 0;
+      const token        = crypto.randomBytes(32).toString('hex');
+
+      // Upsert: handle key resets where membership already exists under old key
+      const existingMembership = membershipId
+        ? db.prepare('SELECT * FROM purchases WHERE membership_id = ?').get(membershipId)
+        : null;
+
+      if (existingMembership) {
+        db.prepare(`UPDATE purchases
+          SET license_key = ?, active_device_id = ?, token = ?, status = 'active', updated_at = unixepoch()
+          WHERE membership_id = ?`)
+          .run(normalized, deviceId, token, membershipId);
+      } else {
+        db.prepare(`INSERT OR IGNORE INTO purchases
+          (membership_id, license_key, email, plan_id, plan_price, status, active_device_id, token)
+          VALUES (?, ?, ?, ?, ?, 'active', ?, ?)`)
+          .run(membershipId || `live-${normalized}`, normalized, email, planId, planPrice, deviceId, token);
+      }
+
+      const tier = planPrice > 0 ? 'paid' : 'free';
+      return res.json({ ok: true, token, tier, email });
+    }
+
+    if (status === 400) {
+      return res.json({ ok: false, error: 'already_active',
+        message: 'This key is already activated on another device. Visit whop.com/@me to reset.' });
+    }
+
+    if (status === 404 || status === 403) {
+      return res.json({ ok: false, error: 'invalid_key' });
+    }
+
+    if (status === 0) {
+      return res.json({ ok: false, error: 'network_error' });
+    }
+  }
+
+  return res.json({ ok: false, error: 'invalid_key' });
+});
+
+// ── License verify ────────────────────────────────────────────────────────────
+app.post('/api/license/verify', async (req, res) => {
+  const { key, token, deviceId, product } = req.body || {};
+  if (!key || !deviceId) return res.status(400).json({ ok: false, error: 'missing_params' });
+
+  const normalized = normalizeLicenseKey(key);
+  const row = db.prepare('SELECT * FROM purchases WHERE license_key = ?').get(normalized);
+
+  if (!row) {
+    // Key not in DB — if it looks like a Whop key, do live check
+    if (isWhopKey(normalized) && WHOP_API_KEY) {
+      const { status, body } = await callWhopValidate(normalized, deviceId);
+      if (status === 200 || status === 201) {
+        return res.json({ ok: true, tier: (body.plan?.price ?? 0) > 0 ? 'paid' : 'free' });
+      }
+      return res.json({ ok: false, error: 'invalid_key' });
+    }
+    return res.json({ ok: false, error: 'invalid_key' });
+  }
+
+  if (row.status !== 'active') {
+    return res.json({ ok: false, error: 'license_refunded' });
+  }
+
+  // Device mismatch
+  if (row.active_device_id && row.active_device_id !== deviceId) {
+    return res.json({ ok: false, error: 'device_mismatch' });
+  }
+
+  const tier = (row.plan_price && row.plan_price > 0) ? 'paid' : 'free';
+  return res.json({ ok: true, tier, email: row.email });
+});
 
 // ── Whop Webhook ──────────────────────────────────────────────────────────────
 app.post('/api/whop/webhook', async (req, res) => {
@@ -168,7 +314,7 @@ app.post('/api/whop/webhook', async (req, res) => {
     const existing = db.prepare('SELECT * FROM purchases WHERE membership_id = ?').get(membershipId);
 
     if (!existing) {
-      // New purchase
+      // New purchase — clear any device binding so fresh activation works
       db.prepare(`
         INSERT INTO purchases (membership_id, license_key, email, plan_id, plan_price, status)
         VALUES (?, ?, ?, ?, ?, 'active')
@@ -182,9 +328,10 @@ app.post('/api/whop/webhook', async (req, res) => {
       }
 
     } else if (existing.license_key !== licenseKey) {
-      // Key was reset — update it
+      // Key was reset — update key and clear device binding
       db.prepare(`
-        UPDATE purchases SET license_key = ?, status = 'active', updated_at = unixepoch()
+        UPDATE purchases
+        SET license_key = ?, status = 'active', active_device_id = NULL, token = NULL, updated_at = unixepoch()
         WHERE membership_id = ?
       `).run(licenseKey, membershipId);
 
